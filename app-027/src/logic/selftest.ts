@@ -5,7 +5,7 @@ import { cleanupContours } from './cleanup'
 import { importSvgText } from './importer'
 import { computeShape } from './pipeline'
 import { buildJob } from './job'
-import { buildA4Sheet, computePlacement, exportGcode, exportPlt, type ExportMeta } from './exporters'
+import { buildA4Sheet, computePlacement, exportGcode, exportPlt, SHEET_MARGIN_MM, type ExportMeta } from './exporters'
 import { polygonArea, polylineLength } from './geometry'
 
 export type CheckResult = {
@@ -362,6 +362,72 @@ export async function runSelfTest(settings: CutSettings = DEFAULT_CUT_SETTINGS, 
         '导出 G-code：单位 mm、进给与重复次数正确',
         hasG21 && hasFeed && passSegments === mat.passes,
         `G21(mm)=${hasG21}｜F${feed}（${mat.speedMmS}mm/s × 60）=${hasFeed}｜pass 段 ${passSegments}/${mat.passes}`,
+      ),
+    )
+
+    // 边距：排入纸幅后四周留出边距（压纸轮安全区），图形不紧贴纸边
+    const marginOk =
+      Math.abs(pl.placedBounds.minX - SHEET_MARGIN_MM) <= 0.01 &&
+      Math.abs(pl.placedBounds.minY - SHEET_MARGIN_MM) <= 0.01 &&
+      !pl.outOfSheet
+    checks.push(
+      ok(
+        'export-margin',
+        `排入纸幅后四周留出 ${SHEET_MARGIN_MM}mm 边距（压纸轮安全区）`,
+        marginOk,
+        `刀路范围 X ${pl.placedBounds.minX.toFixed(1)}~${pl.placedBounds.maxX.toFixed(1)}｜Y ${pl.placedBounds.minY.toFixed(1)}~${pl.placedBounds.maxY.toFixed(1)}（纸幅 ${sheet.widthMm}×${sheet.heightMm}mm）`,
+      ),
+    )
+
+    // G-code 单位：即使单位选择停在 0.025mm，G-code 也必须按 mm 输出（G21）
+    const gStuck = exportGcode(job.steps, { format: 'gcode', unit: '0.025mm', origin: 'bottom_left', yFlip: true, scale: 1 }, sheet, meta, pl)
+    const unitOk = Math.abs(gStuck.maxX - gcode.maxX) <= 1e-9 && Math.abs(gStuck.maxY - gcode.maxY) <= 1e-9 && gStuck.maxX <= sheet.widthMm + 0.001
+    checks.push(
+      ok(
+        'export-gcode-unit',
+        'G-code 单位固定为 mm（单位停在 0.025mm 时坐标不放大 40 倍）',
+        unitOk,
+        `单位 0.025mm 时 X 上限 ${gStuck.maxX.toFixed(3)}mm｜单位 mm 时 ${gcode.maxX.toFixed(3)}mm（应一致且 ≤ 纸宽 ${sheet.widthMm}mm）`,
+      ),
+    )
+
+    // 重复次数：passes=2 的材料（宣纸/植绒）导出的文件必须完整切两遍
+    const mat2 = defaultMaterials().find((m) => m.passes === 2) ?? mat
+    const meta2: ExportMeta = { ...meta, material: mat2, passes: mat2.passes }
+    const plt2 = exportPlt(job.steps, { format: 'plt', unit: '0.025mm', origin: 'bottom_left', yFlip: true, scale: 1 }, sheet, meta2, pl)
+    const g2 = exportGcode(job.steps, { format: 'gcode', unit: 'mm', origin: 'bottom_left', yFlip: true, scale: 1 }, sheet, meta2, pl)
+    const g2PassSegments = (g2.text.match(/; ---- pass \d+\/\d+/g) ?? []).length
+    const passesOk = plt2.runCount === plt.runCount * 2 && g2.runCount === gcode.runCount * 2 && g2PassSegments === 2
+    checks.push(
+      ok(
+        'export-passes',
+        '重复次数：passes=2 的材料（宣纸/植绒）PLT 与 G-code 都完整切两遍',
+        passesOk,
+        `${mat2.name} passes=${mat2.passes}｜PLT 切割段 ${plt.runCount}→${plt2.runCount}｜G-code pass 段 ${g2PassSegments}，切割段 ${gcode.runCount}→${g2.runCount}`,
+      ),
+    )
+
+    // 闭合轮廓（周长不够、没有连刀点的小轮廓）：PLT 必须切回起点，起点不留未切透的小口
+    const tinyShape: Shape = { id: 'st_tiny', name: '小闭合轮廓用例', layer: 0, contours: [rectContour('st_tiny_c', 30, 40, 2, 2)] }
+    const tinyComp = computeShape(tinyShape, settings, mat)
+    const tinyJob = buildJob([tinyShape], new Map([[tinyShape.id, tinyComp]]), [0], { sharedEdge: false, start: { x: 0, y: 0 } })
+    const tinyPl = computePlacement(tinyJob.steps, sheet, 1)
+    const tinyPlt = exportPlt(tinyJob.steps, { format: 'plt', unit: '0.025mm', origin: 'bottom_left', yFlip: true, scale: 1 }, sheet, meta, tinyPl)
+    const tinyRunLines = tinyPlt.text.split('\n').filter((l) => l.startsWith('PU'))
+    const tinyClosedRuns = tinyJob.steps.filter((s) => s.closed).length
+    let closedOk = tinyClosedRuns > 0 && tinyRunLines.length === tinyJob.steps.length
+    tinyJob.steps.forEach((st, i) => {
+      if (!st.closed) return
+      const line = tinyRunLines[i] ?? ''
+      const m = /^PU(-?\d+),(-?\d+);/.exec(line)
+      if (!m || !line.endsWith(`PD${m[1]},${m[2]};PU;`)) closedOk = false
+    })
+    checks.push(
+      ok(
+        'export-closed-loop',
+        '无连刀点的小闭合轮廓在 PLT 中切回起点（起点不留未切透的小口）',
+        closedOk,
+        `2×2mm 小方块（周长 8mm < 每段 ${settings.bridgeEveryMm}mm，0 连刀点）：闭合刀路 ${tinyClosedRuns} 段，末刀坐标 = 起点坐标 ${closedOk ? '吻合' : '不吻合'}`,
       ),
     )
 

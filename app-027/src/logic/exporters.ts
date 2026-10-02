@@ -18,15 +18,17 @@ export function computePlacement(steps: CutStep[], sheet: Sheet, scale: number, 
   const pts: Pt[] = []
   for (const st of steps) pts.push(...st.points)
   const b = pts.length > 0 ? boundsOf(pts) : { minX: 0, minY: 0, maxX: 0, maxY: 0 }
-  const offsetX = -b.minX * scale
-  const offsetY = -b.minY * scale
+  // 四周留出边距（压纸轮安全区），图形不贴纸边
+  const offsetX = marginMm - b.minX * scale
+  const offsetY = marginMm - b.minY * scale
   const placed = {
-    minX: 0,
-    minY: 0,
-    maxX: (b.maxX - b.minX) * scale,
-    maxY: (b.maxY - b.minY) * scale,
+    minX: marginMm,
+    minY: marginMm,
+    maxX: marginMm + (b.maxX - b.minX) * scale,
+    maxY: marginMm + (b.maxY - b.minY) * scale,
   }
-  const outOfSheet = placed.maxX > sheet.widthMm + 0.01 || placed.maxY > sheet.heightMm + 0.01
+  // 可放范围 = 纸幅减去四周边距
+  const outOfSheet = placed.maxX > sheet.widthMm - marginMm + 0.01 || placed.maxY > sheet.heightMm - marginMm + 0.01
   return { marginMm, offsetX, offsetY, scale, outOfSheet, placedBounds: placed }
 }
 
@@ -99,20 +101,32 @@ export function exportPlt(steps: CutStep[], cfg: ExportCfg, sheet: Sheet, meta: 
     maxY = Math.max(maxY, y)
   }
 
-  for (const st of steps) {
-    const first = toExportUnits(st.points[0], cfg, sheet, pl)
-    const cmds: string[] = [`PU${num(first.x, cfg.unit)},${num(first.y, cfg.unit)};`]
-    track(first.x, first.y)
-    pointCount += 1
-    for (let i = 1; i < st.points.length; i++) {
-      const q = toExportUnits(st.points[i], cfg, sheet, pl)
-      cmds.push(`PD${num(q.x, cfg.unit)},${num(q.y, cfg.unit)};`)
-      track(q.x, q.y)
+  // 重复次数：材料要求几遍就完整切几遍（宣纸/植绒需多次轻切）
+  const passes = Math.max(1, Math.round(meta.passes))
+  for (let pass = 1; pass <= passes; pass++) {
+    if (passes > 1) lines.push(`CO"pass ${pass}/${passes}";`)
+    for (const st of steps) {
+      const first = toExportUnits(st.points[0], cfg, sheet, pl)
+      const cmds: string[] = [`PU${num(first.x, cfg.unit)},${num(first.y, cfg.unit)};`]
+      track(first.x, first.y)
       pointCount += 1
+      let last = first
+      for (let i = 1; i < st.points.length; i++) {
+        const q = toExportUnits(st.points[i], cfg, sheet, pl)
+        cmds.push(`PD${num(q.x, cfg.unit)},${num(q.y, cfg.unit)};`)
+        track(q.x, q.y)
+        pointCount += 1
+        last = q
+      }
+      // 闭合轮廓：补切回起点，否则起点处留下一段没切透的小口
+      if (st.closed && (last.x !== first.x || last.y !== first.y)) {
+        cmds.push(`PD${num(first.x, cfg.unit)},${num(first.y, cfg.unit)};`)
+        pointCount += 1
+      }
+      cmds.push('PU;')
+      lines.push(cmds.join(''))
+      runCount += 1
     }
-    cmds.push('PU;')
-    lines.push(cmds.join(''))
-    runCount += 1
   }
   lines.push('SP0;IN;')
 
@@ -132,7 +146,7 @@ export function exportPlt(steps: CutStep[], cfg: ExportCfg, sheet: Sheet, meta: 
     sheetMaxX,
     sheetMaxY,
     unitLabel: cfg.unit === '0.025mm' ? '0.025mm/unit' : 'mm',
-    repeatPasses: meta.passes,
+    repeatPasses: passes,
     feedMmPerMin: meta.material.speedMmS * 60,
   }
 }
@@ -165,25 +179,37 @@ export function exportGcode(steps: CutStep[], cfg: ExportCfg, sheet: Sheet, meta
     maxY = Math.max(maxY, y)
   }
   const fmt = (v: number) => v.toFixed(3)
+  // G-code 一律按毫米输出（G21）：单位选择只作用于 PLT，这里即使停在 0.025mm 也不能放大坐标
+  const toMm = (p: Pt): { x: number; y: number } => {
+    const q = placePoint(p, pl)
+    const y = cfg.origin === 'bottom_left' || cfg.yFlip ? sheet.heightMm - q.y : q.y
+    return { x: q.x, y }
+  }
 
-  lines.push(`; ---- pass 1/${passes} ----`)
-  for (const st of steps) {
-    const seq = st.points.map((p) => {
-      const q = toExportUnits(p, cfg, sheet, pl)
-      return { x: q.x, y: q.y }
-    })
-    const first = seq[0]
-    lines.push(`G0 X${fmt(first.x)} Y${fmt(first.y)} F${travelFeed}`)
-    lines.push(`G1 Z-1.000 F${Math.max(1, Math.round(meta.material.force))}`)
-    track(first.x, first.y)
-    pointCount += 1
-    for (let i = 1; i < seq.length; i++) {
-      lines.push(`G1 X${fmt(seq[i].x)} Y${fmt(seq[i].y)} F${feed}`)
-      track(seq[i].x, seq[i].y)
+  for (let pass = 1; pass <= passes; pass++) {
+    lines.push(`; ---- pass ${pass}/${passes} ----`)
+    for (const st of steps) {
+      const seq = st.points.map(toMm)
+      const first = seq[0]
+      lines.push(`G0 X${fmt(first.x)} Y${fmt(first.y)} F${travelFeed}`)
+      lines.push(`G1 Z-1.000 F${Math.max(1, Math.round(meta.material.force))}`)
+      track(first.x, first.y)
       pointCount += 1
+      let last = first
+      for (let i = 1; i < seq.length; i++) {
+        lines.push(`G1 X${fmt(seq[i].x)} Y${fmt(seq[i].y)} F${feed}`)
+        track(seq[i].x, seq[i].y)
+        pointCount += 1
+        last = seq[i]
+      }
+      // 闭合轮廓：补切回起点，否则起点处留下一段没切透的小口
+      if (st.closed && (Math.abs(last.x - first.x) > 1e-9 || Math.abs(last.y - first.y) > 1e-9)) {
+        lines.push(`G1 X${fmt(first.x)} Y${fmt(first.y)} F${feed}`)
+        pointCount += 1
+      }
+      lines.push('G0 Z0')
+      runCount += 1
     }
-    lines.push('G0 Z0')
-    runCount += 1
   }
   lines.push('G0 X0 Y0')
   lines.push('M2 ; end')
