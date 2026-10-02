@@ -48,8 +48,7 @@ const cfg = computed<ExportCfg>(() => project.value?.export ?? { format: 'plt', 
 const placement = computed(() => {
   const p = project.value
   if (!p || !job.value) return null
-  const sheet = { name: 'A4', widthMm: 210, heightMm: 297 }
-  return computePlacement(job.value.steps, sheet, p.export.scale)
+  return computePlacement(job.value.steps, p.sheet, p.export.scale)
 })
 
 const meta = computed<ExportMeta | null>(() => {

@@ -5,7 +5,7 @@ import { cleanupContours } from './cleanup'
 import { importSvgText } from './importer'
 import { computeShape } from './pipeline'
 import { buildJob } from './job'
-import { buildA4Sheet, computePlacement, exportGcode, exportPlt, type ExportMeta } from './exporters'
+import { buildA4Sheet, computePlacement, exportGcode, exportPlt, OVERCUT_MM, SHEET_MARGIN_MM, type ExportMeta } from './exporters'
 import { polygonArea, polylineLength } from './geometry'
 
 export type CheckResult = {
@@ -341,27 +341,69 @@ export async function runSelfTest(settings: CutSettings = DEFAULT_CUT_SETTINGS, 
     }
     const inSheet = plt.minX >= 0 && plt.minY >= 0 && plt.maxX <= plt.sheetMaxX && plt.maxY <= plt.sheetMaxY
     const flipOk = Math.abs(plt.minY - exportYOfMax) <= 1
+    // 四周必须留出内边距（压纸轮不能压到刀路）：排版图左下角应对齐 (margin, margin)
+    const marginUnits = Math.round(SHEET_MARGIN_MM / 0.025)
+    const marginOk = plt.minX === marginUnits && pl.placedBounds.minX === SHEET_MARGIN_MM && pl.placedBounds.minY === SHEET_MARGIN_MM
     checks.push(
       ok(
         'export-plt',
-        '导出 PLT：坐标全部落在纸幅内、原点在左下（y′ = 纸幅高 − y）',
-        inSheet && flipOk,
+        '导出 PLT：坐标全部落在纸幅内、四周留出内边距、原点在左下（y′ = 纸幅高 − y）',
+        inSheet && flipOk && marginOk,
         `X ${plt.minX}~${plt.maxX}｜Y ${plt.minY}~${plt.maxY}（0.025mm/单位，纸幅上限 ${plt.sheetMaxX}×${plt.sheetMaxY}）｜` +
+          `内边距 ${SHEET_MARGIN_MM}mm = ${marginUnits} 单位（实测最小坐标 ${plt.minX}）｜` +
           `内部最大 y = ${maxInternalY.toFixed(2)}mm → 导出最小 y = ${exportYOfMax}（左下原点）`,
       ),
     )
 
-    const gcode = exportGcode(job.steps, { format: 'gcode', unit: 'mm', origin: 'bottom_left', yFlip: true, scale: 1 }, sheet, meta, pl)
+    // 重复次数：passes=2 时 PLT / G-code 都要把整组刀路完整输出两遍（宣纸/植绒一遍切不透）
+    const plt2 = exportPlt(job.steps, { format: 'plt', unit: '0.025mm', origin: 'bottom_left', yFlip: true, scale: 1 }, sheet, { ...meta, passes: 2 }, pl)
+    const gRep = exportGcode(job.steps, { format: 'gcode', unit: 'mm', origin: 'bottom_left', yFlip: true, scale: 1 }, sheet, { ...meta, passes: 2 }, pl)
+    const gRepPasses = (gRep.text.match(/; ---- pass \d+\/\d+/g) ?? []).length
+    checks.push(
+      ok(
+        'export-passes',
+        '重复次数生效：passes=2 时 PLT / G-code 的刀路完整输出两遍',
+        plt2.runCount === job.steps.length * 2 && plt2.repeatPasses === 2 && gRep.runCount === job.steps.length * 2 && gRepPasses === 2,
+        `PLT 切割段 ${plt2.runCount}（=${job.steps.length}×2）｜G-code pass 段 ${gRepPasses}/2、切割段 ${gRep.runCount}（=${job.steps.length}×2）`,
+      ),
+    )
+
+    // 单位选项停在 0.025mm（PLT 的 HPGL 标准单位）时切到 G-code：坐标仍必须按毫米输出，不能放大 40 倍
+    const gcode = exportGcode(job.steps, { format: 'gcode', unit: '0.025mm', origin: 'bottom_left', yFlip: true, scale: 1 }, sheet, meta, pl)
     const hasG21 = gcode.text.includes('G21')
     const feed = Math.round(mat.speedMmS * 60)
     const hasFeed = gcode.text.includes(`F${feed}`)
     const passSegments = (gcode.text.match(/; ---- pass \d+\/\d+/g) ?? []).length
+    const mmScale = gcode.unitLabel === 'mm' && !gcode.outOfSheet && gcode.maxX <= sheet.widthMm && gcode.maxY <= sheet.heightMm
     checks.push(
       ok(
         'export-gcode',
-        '导出 G-code：单位 mm、进给与重复次数正确',
-        hasG21 && hasFeed && passSegments === mat.passes,
-        `G21(mm)=${hasG21}｜F${feed}（${mat.speedMmS}mm/s × 60）=${hasFeed}｜pass 段 ${passSegments}/${mat.passes}`,
+        '导出 G-code：单位 mm（不受 0.025mm 单位选项影响）、进给与重复次数正确',
+        hasG21 && hasFeed && passSegments === mat.passes && mmScale,
+        `G21(mm)=${hasG21}｜F${feed}（${mat.speedMmS}mm/s × 60）=${hasFeed}｜pass 段 ${passSegments}/${mat.passes}｜` +
+          `单位选项 0.025mm 下坐标仍按 mm：X ≤ ${gcode.maxX.toFixed(1)}、Y ≤ ${gcode.maxY.toFixed(1)}（纸幅 ${sheet.widthMm}×${sheet.heightMm}mm）`,
+      ),
+    )
+
+    // 无连刀点的小闭合轮廓：导出时必须走回起点并过切，否则起点处留一个切不透的小口
+    const ocShape: Shape = { id: 'st_overcut', name: '过切用例', layer: 0, contours: [rectContour('st_oc', 0, 0, 3, 2)] }
+    const ocComp = computeShape(ocShape, settings, mat)
+    const ocJob = buildJob([ocShape], new Map([[ocShape.id, ocComp]]), [0], { sharedEdge: false, start: { x: 0, y: 0 } })
+    const ocPl = computePlacement(ocJob.steps, sheet, 1)
+    const ocPlt = exportPlt(ocJob.steps, { format: 'plt', unit: 'mm', origin: 'top_left', yFlip: false, scale: 1 }, sheet, { ...meta, passes: 1 }, ocPl)
+    // 3×2mm 矩形：周长 10mm < 每段 12mm → 0 个连刀点，单段闭合刀路；贴边距后起点 (10,10)，过切 1mm 至 (11,10)
+    const ocOk =
+      ocJob.steps.length === 1 &&
+      ocJob.steps[0].closed &&
+      ocPlt.pointCount === ocJob.steps[0].points.length + 2 &&
+      ocPlt.text.includes('PD10.00,10.00;PD11.00,10.00;')
+    checks.push(
+      ok(
+        'export-overcut',
+        '无连刀点的闭合小轮廓：导出刀路走回起点并过切，起点不留切不透的小口',
+        ocOk,
+        `3×2mm 矩形（周长 10mm，0 个连刀点）：导出点 ${ocPlt.pointCount}（4 顶点 + 回起点 + 过切）｜` +
+          `末段 …PD10.00,10.00;PD11.00,10.00;（回到起点后沿轮廓过切 ${OVERCUT_MM}mm）`,
       ),
     )
 

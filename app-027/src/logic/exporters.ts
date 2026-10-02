@@ -1,6 +1,6 @@
 import type { ExportCfg, MaterialPreset, Pt, Sheet } from './types'
 import type { CutStep } from './order'
-import { boundsOf, dist } from './geometry'
+import { boundsOf, dist, pointAtArcLength, polylineLength } from './geometry'
 
 export type SheetPlacement = {
   /** 纸面内边距（mm） */
@@ -18,15 +18,17 @@ export function computePlacement(steps: CutStep[], sheet: Sheet, scale: number, 
   const pts: Pt[] = []
   for (const st of steps) pts.push(...st.points)
   const b = pts.length > 0 ? boundsOf(pts) : { minX: 0, minY: 0, maxX: 0, maxY: 0 }
-  const offsetX = -b.minX * scale
-  const offsetY = -b.minY * scale
+  // 图形左下角对齐纸面内边距：压纸轮需要四周留白，不能贴着纸边下刀
+  const offsetX = marginMm - b.minX * scale
+  const offsetY = marginMm - b.minY * scale
   const placed = {
-    minX: 0,
-    minY: 0,
-    maxX: (b.maxX - b.minX) * scale,
-    maxY: (b.maxY - b.minY) * scale,
+    minX: marginMm,
+    minY: marginMm,
+    maxX: marginMm + (b.maxX - b.minX) * scale,
+    maxY: marginMm + (b.maxY - b.minY) * scale,
   }
-  const outOfSheet = placed.maxX > sheet.widthMm + 0.01 || placed.maxY > sheet.heightMm + 0.01
+  // 可放范围是内边距以内的区域：越过「纸幅 − 边距」即判出界
+  const outOfSheet = placed.maxX > sheet.widthMm - marginMm + 0.01 || placed.maxY > sheet.heightMm - marginMm + 0.01
   return { marginMm, offsetX, offsetY, scale, outOfSheet, placedBounds: placed }
 }
 
@@ -75,13 +77,34 @@ function num(v: number, unit: 'mm' | '0.025mm'): string {
   return unit === '0.025mm' ? String(Math.round(v)) : v.toFixed(2)
 }
 
+/** 闭合刀路的过切量（mm）：回到起点后再沿轮廓多切一小段 */
+export const OVERCUT_MM = 1
+
+/**
+ * 单段刀路的导出点列。
+ * 无连刀点的闭合段（周长太短的小轮廓）导出时显式回到起点并沿轮廓过切一小段：
+ * 刻刀在起点落刀时刀尖尚未转到位，恰好停在起点会留下一个切不透的小口。
+ */
+export function stepExportPoints(st: CutStep): Pt[] {
+  const pts = st.points
+  if (!st.closed || pts.length < 3) return pts
+  const L = polylineLength(pts, true)
+  if (L <= 0) return pts
+  const out = pts.slice()
+  out.push(pts[0]) // 显式走回起点，补上首尾之间的闭合段
+  const over = Math.min(OVERCUT_MM, L * 0.25)
+  if (over > 1e-6) out.push(pointAtArcLength(pts, true, over)) // 越过起点再切一小段
+  return out
+}
+
 /** PLT（HPGL）：1 unit = 0.025mm，原点左下 */
 export function exportPlt(steps: CutStep[], cfg: ExportCfg, sheet: Sheet, meta: ExportMeta, pl: SheetPlacement): ExportStats {
+  const passes = Math.max(1, Math.round(meta.passes))
   const lines: string[] = []
   lines.push(`IN;SP1;`)
   lines.push(`CO"Paper-cut Plotter Studio / ${sanitize(meta.projectName)}";`)
   lines.push(
-    `CO"paper=${meta.material.paper} force=${meta.material.force} speed=${meta.material.speedMmS}mm/s passes=${meta.passes} bridge=${meta.bridgeWidthMm}mm";`,
+    `CO"paper=${meta.material.paper} force=${meta.material.force} speed=${meta.material.speedMmS}mm/s passes=${passes} bridge=${meta.bridgeWidthMm}mm";`,
   )
   lines.push(`CO"sheet=${meta.sheet.widthMm}x${meta.sheet.heightMm}mm origin=bottom_left unit=${cfg.unit} scale=${cfg.scale}";`)
 
@@ -99,20 +122,25 @@ export function exportPlt(steps: CutStep[], cfg: ExportCfg, sheet: Sheet, meta: 
     maxY = Math.max(maxY, y)
   }
 
-  for (const st of steps) {
-    const first = toExportUnits(st.points[0], cfg, sheet, pl)
-    const cmds: string[] = [`PU${num(first.x, cfg.unit)},${num(first.y, cfg.unit)};`]
-    track(first.x, first.y)
-    pointCount += 1
-    for (let i = 1; i < st.points.length; i++) {
-      const q = toExportUnits(st.points[i], cfg, sheet, pl)
-      cmds.push(`PD${num(q.x, cfg.unit)},${num(q.y, cfg.unit)};`)
-      track(q.x, q.y)
+  // 重复次数：同一组刀路完整输出多遍（宣纸/植绒等需要多遍轻切才切得透）
+  for (let pass = 1; pass <= passes; pass++) {
+    if (passes > 1) lines.push(`CO"pass ${pass}/${passes}";`)
+    for (const st of steps) {
+      const pts = stepExportPoints(st)
+      const first = toExportUnits(pts[0], cfg, sheet, pl)
+      const cmds: string[] = [`PU${num(first.x, cfg.unit)},${num(first.y, cfg.unit)};`]
+      track(first.x, first.y)
       pointCount += 1
+      for (let i = 1; i < pts.length; i++) {
+        const q = toExportUnits(pts[i], cfg, sheet, pl)
+        cmds.push(`PD${num(q.x, cfg.unit)},${num(q.y, cfg.unit)};`)
+        track(q.x, q.y)
+        pointCount += 1
+      }
+      cmds.push('PU;')
+      lines.push(cmds.join(''))
+      runCount += 1
     }
-    cmds.push('PU;')
-    lines.push(cmds.join(''))
-    runCount += 1
   }
   lines.push('SP0;IN;')
 
@@ -132,7 +160,7 @@ export function exportPlt(steps: CutStep[], cfg: ExportCfg, sheet: Sheet, meta: 
     sheetMaxX,
     sheetMaxY,
     unitLabel: cfg.unit === '0.025mm' ? '0.025mm/unit' : 'mm',
-    repeatPasses: meta.passes,
+    repeatPasses: passes,
     feedMmPerMin: meta.material.speedMmS * 60,
   }
 }
@@ -142,6 +170,8 @@ export function exportGcode(steps: CutStep[], cfg: ExportCfg, sheet: Sheet, meta
   const feed = Math.max(1, Math.round(meta.material.speedMmS * 60))
   const travelFeed = Math.max(feed, 3000)
   const passes = Math.max(1, Math.round(meta.passes))
+  // G-code 一律按毫米输出（G21）：PLT 的 0.025mm 单位选项串到 G-code 会把坐标放大 40 倍
+  const mmCfg: ExportCfg = { ...cfg, unit: 'mm' }
   const lines: string[] = []
   lines.push('; Paper-cut Plotter Studio - G-code for desktop plotter')
   lines.push(`; project=${meta.projectName} form=${meta.formName}`)
@@ -166,24 +196,27 @@ export function exportGcode(steps: CutStep[], cfg: ExportCfg, sheet: Sheet, meta
   }
   const fmt = (v: number) => v.toFixed(3)
 
-  lines.push(`; ---- pass 1/${passes} ----`)
-  for (const st of steps) {
-    const seq = st.points.map((p) => {
-      const q = toExportUnits(p, cfg, sheet, pl)
-      return { x: q.x, y: q.y }
-    })
-    const first = seq[0]
-    lines.push(`G0 X${fmt(first.x)} Y${fmt(first.y)} F${travelFeed}`)
-    lines.push(`G1 Z-1.000 F${Math.max(1, Math.round(meta.material.force))}`)
-    track(first.x, first.y)
-    pointCount += 1
-    for (let i = 1; i < seq.length; i++) {
-      lines.push(`G1 X${fmt(seq[i].x)} Y${fmt(seq[i].y)} F${feed}`)
-      track(seq[i].x, seq[i].y)
+  // 重复次数：同一组刀路完整输出多遍（宣纸/植绒等需要多遍轻切才切得透）
+  for (let pass = 1; pass <= passes; pass++) {
+    lines.push(`; ---- pass ${pass}/${passes} ----`)
+    for (const st of steps) {
+      const seq = stepExportPoints(st).map((p) => {
+        const q = toExportUnits(p, mmCfg, sheet, pl)
+        return { x: q.x, y: q.y }
+      })
+      const first = seq[0]
+      lines.push(`G0 X${fmt(first.x)} Y${fmt(first.y)} F${travelFeed}`)
+      lines.push(`G1 Z-1.000 F${Math.max(1, Math.round(meta.material.force))}`)
+      track(first.x, first.y)
       pointCount += 1
+      for (let i = 1; i < seq.length; i++) {
+        lines.push(`G1 X${fmt(seq[i].x)} Y${fmt(seq[i].y)} F${feed}`)
+        track(seq[i].x, seq[i].y)
+        pointCount += 1
+      }
+      lines.push('G0 Z0')
+      runCount += 1
     }
-    lines.push('G0 Z0')
-    runCount += 1
   }
   lines.push('G0 X0 Y0')
   lines.push('M2 ; end')
